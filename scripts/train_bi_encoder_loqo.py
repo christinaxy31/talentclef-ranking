@@ -43,17 +43,22 @@ from evaluation import ndcg_at_k, recall_at_k, reciprocal_rank  # noqa: E402
 SPLIT_DIR = Path(__file__).resolve().parent.parent / "data" / "TaskA" / "development" / "en"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "results" / "checkpoints" / "loqo_46795_mpnet_triplet"
 
-HELD_OUT_QUERY_ID = "46795"
+HELD_OUT_QUERY_ID = "29243"
 NEG_PER_POSITIVE = 4
 JACCARD_THRESHOLD = 0.6
 SEED = 42
 BATCH_SIZE = 8
-LEARNING_RATE = 2e-5
+LEARNING_RATE = 1e-6
 MARGIN = 0.5
+MAX_GRAD_NORM = 1.0
 # 220 steps x batch size 8 = 1760 triplets = exactly one full epoch over the
 # training positives. Raised from the 10-step smoke test to test whether the
 # held-out degradation we saw was a "too little training" artifact.
 MAX_STEPS = 220
+# Evaluate on the held-out query every EVAL_EVERY steps during training (not
+# just before/after), so a collapse can be traced to roughly where it happens
+# instead of only being visible as a single before/after number.
+EVAL_EVERY = 20
 
 
 def build_triplets(train_query_ids, queries, corpus, qrels, rng):
@@ -90,7 +95,37 @@ def to_device(features, device):
     return {key: (value.to(device) if hasattr(value, "to") else value) for key, value in features.items()}
 
 
-def train_manual(model, loss_fn, triplets, rng):
+def evaluate_held_out(model_or_path, queries, corpus, qrels):
+    if isinstance(model_or_path, SentenceTransformer):
+        bi_encoder = BiEncoder(
+            corpus,
+            model=model_or_path,
+        )
+    else:
+        bi_encoder = BiEncoder(
+            corpus,
+            model_name=model_or_path,
+        )
+
+    relevant_ids = qrels.get(HELD_OUT_QUERY_ID, [])
+
+    retrieved_ids = [
+        doc_id
+        for doc_id, _score in bi_encoder.rank(
+            queries[HELD_OUT_QUERY_ID],
+            top_k=50,
+        )
+    ]
+
+    return {
+        "recall@10": recall_at_k(retrieved_ids, relevant_ids, k=10),
+        "recall@50": recall_at_k(retrieved_ids, relevant_ids, k=50),
+        "mrr": reciprocal_rank(retrieved_ids, relevant_ids),
+        "ndcg@10": ndcg_at_k(retrieved_ids, relevant_ids, k=10),
+    }
+
+
+def train_manual(model, loss_fn, triplets, rng, queries, corpus, qrels):
     """Plain training loop: builds the optimizer directly on model.parameters(),
     the same tensors used in the forward pass, so updates can't get lost."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
@@ -117,24 +152,18 @@ def train_manual(model, loss_fn, triplets, rng):
         optimizer.zero_grad()
         loss = loss_fn([anchor_features, positive_features, negative_features], labels=None)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
         optimizer.step()
 
         if step % 10 == 0 or step == MAX_STEPS:
             print(f"step {step}/{MAX_STEPS}  loss={loss.item():.4f}")
 
-
-def evaluate_held_out(model_name_or_path, queries, corpus, qrels):
-    bi_encoder = BiEncoder(corpus, model_name=model_name_or_path)
-    relevant_ids = qrels.get(HELD_OUT_QUERY_ID, [])
-    retrieved_ids = [
-        doc_id for doc_id, _score in bi_encoder.rank(queries[HELD_OUT_QUERY_ID], top_k=50)
-    ]
-    return {
-        "recall@10": recall_at_k(retrieved_ids, relevant_ids, k=10),
-        "recall@50": recall_at_k(retrieved_ids, relevant_ids, k=50),
-        "mrr": reciprocal_rank(retrieved_ids, relevant_ids),
-        "ndcg@10": ndcg_at_k(retrieved_ids, relevant_ids, k=10),
-    }
+        if step % EVAL_EVERY == 0 or step == MAX_STEPS:
+            model.eval()
+            with torch.no_grad():
+                held_out_metrics = evaluate_held_out(model, queries, corpus, qrels)
+            model.train()
+            print(f"  held-out eval @ step {step}: {held_out_metrics}")
 
 
 def main() -> None:
@@ -158,7 +187,7 @@ def main() -> None:
     loss_fn = TripletLoss(model, distance_metric=TripletDistanceMetric.COSINE, triplet_margin=MARGIN)
 
     train_rng = random.Random(SEED)
-    train_manual(model, loss_fn, triplets, train_rng)
+    train_manual(model, loss_fn, triplets, train_rng, queries, corpus, qrels)
 
     print("\nSanity check: confirming fine-tuned weights differ from the base model...")
     base_model = SentenceTransformer(MODEL_NAME)
