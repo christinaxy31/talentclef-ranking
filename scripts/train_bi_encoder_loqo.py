@@ -1,12 +1,16 @@
 
-"""First LOQO bi-encoder fine-tuning experiment: single fold, random-negative TripletLoss.
+"""First LOQO bi-encoder fine-tuning experiment: single fold, hard-negative TripletLoss.
 
 Holds out one query (HELD_OUT_QUERY_ID) and fine-tunes on the other 9 training
-queries from the English development split. For each training-query positive,
-up to NEG_PER_POSITIVE random negatives are sampled from documents not listed
-as positive for that query (cross-query positives are allowed as negatives,
-per experiment design). Near-duplicate negatives are filtered out via a token
-Jaccard threshold against the positive they'd be paired with.
+queries from the English development split. Negatives are mined statically:
+the zero-shot base model ranks the full corpus against each training query
+once, and up to NEG_PER_POSITIVE negatives per positive are sampled from the
+top HARD_NEGATIVE_POOL_SIZE non-positive documents (cross-query positives are
+allowed as negatives, per experiment design). Near-duplicate negatives are
+filtered out via a token Jaccard threshold against the positive they'd be
+paired with — this matters more here than with random negatives, since a hard
+negative that's secretly an unjudged true positive is a much worse training
+signal than an easy, unrelated one would be.
 
 Training uses a plain manual loop (backward()/optimizer.step() directly), not
 sentence-transformers' SentenceTransformerTrainer: that Trainer/accelerate path
@@ -41,7 +45,6 @@ from data_loader import load_corpus, load_qrels, load_queries  # noqa: E402
 from evaluation import ndcg_at_k, recall_at_k, reciprocal_rank  # noqa: E402
 
 SPLIT_DIR = Path(__file__).resolve().parent.parent / "data" / "TaskA" / "development" / "en"
-OUTPUT_DIR = Path(__file__).resolve().parent.parent / "results" / "checkpoints" / "loqo_46795_mpnet_triplet"
 
 HELD_OUT_QUERY_ID = "29243"
 NEG_PER_POSITIVE = 4
@@ -51,6 +54,17 @@ BATCH_SIZE = 8
 LEARNING_RATE = 1e-6
 MARGIN = 0.5
 MAX_GRAD_NORM = 1.0
+# Static hard-negative mining: rank the full corpus against each training
+# query once (using the zero-shot base model), then sample negatives from the
+# top-ranked non-positive documents instead of uniformly at random.
+HARD_NEGATIVE_POOL_SIZE = 50
+
+OUTPUT_DIR = (
+    Path(__file__).resolve().parent.parent
+    / "results"
+    / "checkpoints"
+    / f"loqo_{HELD_OUT_QUERY_ID}_mpnet_triplet"
+)
 # 220 steps x batch size 8 = 1760 triplets = exactly one full epoch over the
 # training positives. Raised from the 10-step smoke test to test whether the
 # held-out degradation we saw was a "too little training" artifact.
@@ -61,10 +75,23 @@ MAX_STEPS = 220
 EVAL_EVERY = 20
 
 
-def build_triplets(train_query_ids, queries, corpus, qrels, rng):
+def mine_hard_negative_pools(train_query_ids, queries, corpus, qrels):
+    """Rank the full corpus against each training query with the zero-shot base
+    model once, returning {query_id: [top HARD_NEGATIVE_POOL_SIZE non-positive
+    doc_ids]} — the hard-negative candidate pool for that query."""
+    bi_encoder = BiEncoder(corpus, model_name=MODEL_NAME)
+    pools = {}
+    for query_id in train_query_ids:
+        positives = set(qrels.get(query_id, []))
+        ranked = bi_encoder.rank(queries[query_id], top_k=len(corpus))
+        hard_candidates = [doc_id for doc_id, _score in ranked if doc_id not in positives]
+        pools[query_id] = hard_candidates[:HARD_NEGATIVE_POOL_SIZE]
+    return pools
+
+
+def build_triplets(train_query_ids, queries, corpus, qrels, rng, hard_negative_pools):
     """(anchor, positive, negative) triplets with a token-Jaccard near-duplicate filter."""
     token_sets = {doc_id: set(tokenize(text)) for doc_id, text in corpus.items()}
-    all_doc_ids = set(corpus.keys())
 
     def jaccard(a, b):
         return len(a & b) / len(a | b)
@@ -72,7 +99,7 @@ def build_triplets(train_query_ids, queries, corpus, qrels, rng):
     triplets = []
     for query_id in train_query_ids:
         positives = qrels.get(query_id, [])
-        negative_pool = list(all_doc_ids - set(positives))
+        negative_pool = hard_negative_pools[query_id]
         for pos_id in positives:
             candidates = [
                 doc_id
@@ -174,7 +201,10 @@ def main() -> None:
     train_query_ids = [qid for qid in queries if qid != HELD_OUT_QUERY_ID]
     rng = random.Random(SEED)
 
-    triplets = build_triplets(train_query_ids, queries, corpus, qrels, rng)
+    print("Mining hard-negative pools (ranking corpus against each training query)...")
+    hard_negative_pools = mine_hard_negative_pools(train_query_ids, queries, corpus, qrels)
+
+    triplets = build_triplets(train_query_ids, queries, corpus, qrels, rng, hard_negative_pools)
     print(f"Held-out query: {HELD_OUT_QUERY_ID} ({queries[HELD_OUT_QUERY_ID].splitlines()[0]})")
     print(f"Training queries: {len(train_query_ids)}")
     print(f"Triplets built: {len(triplets)}")
