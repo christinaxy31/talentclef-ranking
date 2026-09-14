@@ -7,3 +7,6 @@ __pycache__/
 # TalentCLEF datasets: large / redistribution-restricted, download separately
 data/*
 !data/.gitkeep
+
+# fine-tuned model checkpoints: large binaries, reproducible via training scripts
+results/checkpoints/
