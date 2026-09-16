@@ -46,13 +46,13 @@ from evaluation import ndcg_at_k, recall_at_k, reciprocal_rank  # noqa: E402
 
 SPLIT_DIR = Path(__file__).resolve().parent.parent / "data" / "TaskA" / "development" / "en"
 
-HELD_OUT_QUERY_ID = "29243"
+HELD_OUT_QUERY_ID = "46795"
 NEG_PER_POSITIVE = 4
 JACCARD_THRESHOLD = 0.6
 SEED = 42
 BATCH_SIZE = 8
 LEARNING_RATE = 1e-6
-MARGIN = 0.5
+MARGIN = 0.2
 MAX_GRAD_NORM = 1.0
 # Static hard-negative mining: rank the full corpus against each training
 # query once (using the zero-shot base model), then sample negatives from the
