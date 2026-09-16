@@ -1,30 +1,28 @@
+"""Full LOQO bi-encoder fine-tuning sweep: one fold per query, hard-negative TripletLoss.
 
-"""First LOQO bi-encoder fine-tuning experiment: single fold, hard-negative TripletLoss.
-
-Holds out one query (HELD_OUT_QUERY_ID) and fine-tunes on the other 9 training
-queries from the English development split. Negatives are mined statically:
-the zero-shot base model ranks the full corpus against each training query
-once, and up to NEG_PER_POSITIVE negatives per positive are sampled from the
-top HARD_NEGATIVE_POOL_SIZE non-positive documents (cross-query positives are
-allowed as negatives, per experiment design). Near-duplicate negatives are
-filtered out via a token Jaccard threshold against the positive they'd be
-paired with — this matters more here than with random negatives, since a hard
-negative that's secretly an unjudged true positive is a much worse training
-signal than an easy, unrelated one would be.
+Runs leave-one-query-out cross-validation across all 10 English development
+queries. For each fold: hold out one query, mine hard negatives for the other
+9 (rank the full corpus against each training query with the zero-shot base
+model, keep the top HARD_NEGATIVE_POOL_SIZE non-positive documents per query),
+build up to NEG_PER_POSITIVE triplets per positive from that pool (near-dup
+negatives filtered by token Jaccard against the positive), train a *fresh*
+model from scratch with TripletLoss, and evaluate on the held-out query.
 
 Training uses a plain manual loop (backward()/optimizer.step() directly), not
 sentence-transformers' SentenceTransformerTrainer: that Trainer/accelerate path
-was found to silently leave model weights unchanged after training (confirmed
-via the weight-diff sanity check below) while still logging plausible-looking
-loss values — most likely an optimizer built on parameter tensors that get
-disconnected from the model during accelerate's device/dtype placement. A
-manual loop builds the optimizer directly on the tensors used in the forward
-pass, so there's no place for that disconnect to happen.
+was found to silently leave model weights unchanged after training while still
+logging plausible-looking loss values. Gradient clipping (MAX_GRAD_NORM) is
+applied explicitly since the Trainer did this for us by default and the manual
+loop otherwise wouldn't. The held-out NDCG@10 is checked periodically during
+training (EVAL_EVERY) and the best-scoring checkpoint is kept, since it can
+peak well before MAX_STEPS and then decay (classic overfitting curve) - the
+final step is not necessarily the best one.
 
-After training, the fine-tuned model is compared against the zero-shot base
-model on the held-out query using the existing evaluation pipeline.
+Results are saved incrementally to RESULTS_PATH after each fold, so an
+interrupted run (e.g. a Colab timeout) doesn't lose completed folds.
 """
 
+import json
 import random
 import sys
 from pathlib import Path
@@ -45,8 +43,9 @@ from data_loader import load_corpus, load_qrels, load_queries  # noqa: E402
 from evaluation import ndcg_at_k, recall_at_k, reciprocal_rank  # noqa: E402
 
 SPLIT_DIR = Path(__file__).resolve().parent.parent / "data" / "TaskA" / "development" / "en"
+CHECKPOINT_DIR = Path(__file__).resolve().parent.parent / "results" / "checkpoints"
+RESULTS_PATH = Path(__file__).resolve().parent.parent / "results" / "loqo_full_sweep.json"
 
-HELD_OUT_QUERY_ID = "46795"
 NEG_PER_POSITIVE = 4
 JACCARD_THRESHOLD = 0.6
 SEED = 42
@@ -58,21 +57,17 @@ MAX_GRAD_NORM = 1.0
 # query once (using the zero-shot base model), then sample negatives from the
 # top-ranked non-positive documents instead of uniformly at random.
 HARD_NEGATIVE_POOL_SIZE = 50
-
-OUTPUT_DIR = (
-    Path(__file__).resolve().parent.parent
-    / "results"
-    / "checkpoints"
-    / f"loqo_{HELD_OUT_QUERY_ID}_mpnet_triplet"
-)
 # 220 steps x batch size 8 = 1760 triplets = exactly one full epoch over the
-# training positives. Raised from the 10-step smoke test to test whether the
-# held-out degradation we saw was a "too little training" artifact.
+# training positives (per fold; each fold has a slightly different triplet
+# count since a different query's positives are excluded from training).
 MAX_STEPS = 220
 # Evaluate on the held-out query every EVAL_EVERY steps during training (not
-# just before/after), so a collapse can be traced to roughly where it happens
-# instead of only being visible as a single before/after number.
+# just before/after), so the best checkpoint can be found and traced.
 EVAL_EVERY = 20
+
+# Restrict to specific query ids for a quick test (e.g. ["46795"]), or None to
+# run the full 10-fold sweep.
+FOLD_QUERY_IDS = None
 
 
 def mine_hard_negative_pools(train_query_ids, queries, corpus, qrels):
@@ -122,28 +117,18 @@ def to_device(features, device):
     return {key: (value.to(device) if hasattr(value, "to") else value) for key, value in features.items()}
 
 
-def evaluate_held_out(model_or_path, queries, corpus, qrels):
+def evaluate_held_out(model_or_path, held_out_query_id, queries, corpus, qrels):
+    """model_or_path: a model name/checkpoint path, or an in-memory SentenceTransformer
+    (the latter avoids a disk round-trip for periodic in-training checks)."""
     if isinstance(model_or_path, SentenceTransformer):
-        bi_encoder = BiEncoder(
-            corpus,
-            model=model_or_path,
-        )
+        bi_encoder = BiEncoder(corpus, model=model_or_path)
     else:
-        bi_encoder = BiEncoder(
-            corpus,
-            model_name=model_or_path,
-        )
+        bi_encoder = BiEncoder(corpus, model_name=model_or_path)
 
-    relevant_ids = qrels.get(HELD_OUT_QUERY_ID, [])
-
+    relevant_ids = qrels.get(held_out_query_id, [])
     retrieved_ids = [
-        doc_id
-        for doc_id, _score in bi_encoder.rank(
-            queries[HELD_OUT_QUERY_ID],
-            top_k=50,
-        )
+        doc_id for doc_id, _score in bi_encoder.rank(queries[held_out_query_id], top_k=50)
     ]
-
     return {
         "recall@10": recall_at_k(retrieved_ids, relevant_ids, k=10),
         "recall@50": recall_at_k(retrieved_ids, relevant_ids, k=50),
@@ -152,15 +137,14 @@ def evaluate_held_out(model_or_path, queries, corpus, qrels):
     }
 
 
-def train_manual(model, loss_fn, triplets, rng, queries, corpus, qrels):
+def train_manual(model, loss_fn, triplets, rng, held_out_query_id, queries, corpus, qrels):
     """Plain training loop: builds the optimizer directly on model.parameters(),
     the same tensors used in the forward pass, so updates can't get lost.
 
     Returns (best_state_dict, best_step, best_ndcg): the held-out NDCG@10 doesn't
-    necessarily peak at the final step (we've seen it rise then decay well before
+    necessarily peak at the final step (it can rise then decay well before
     MAX_STEPS), so the best state seen at any periodic eval is kept in memory and
-    handed back, rather than silently discarding it in favor of whatever the
-    final step happens to look like.
+    handed back, rather than discarding it in favor of the final step.
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     device = model.device
@@ -199,7 +183,7 @@ def train_manual(model, loss_fn, triplets, rng, queries, corpus, qrels):
         if step % EVAL_EVERY == 0 or step == MAX_STEPS:
             model.eval()
             with torch.no_grad():
-                held_out_metrics = evaluate_held_out(model, queries, corpus, qrels)
+                held_out_metrics = evaluate_held_out(model, held_out_query_id, queries, corpus, qrels)
             model.train()
             print(f"  held-out eval @ step {step}: {held_out_metrics}")
 
@@ -211,24 +195,23 @@ def train_manual(model, loss_fn, triplets, rng, queries, corpus, qrels):
     return best_state_dict, best_step, best_ndcg
 
 
-def main() -> None:
-    queries = load_queries(SPLIT_DIR)
-    corpus = load_corpus(SPLIT_DIR)
-    qrels = load_qrels(SPLIT_DIR)
+def run_fold(held_out_query_id, queries, corpus, qrels):
+    """Train and evaluate a single LOQO fold, returning zero-shot vs. best
+    fine-tuned held-out metrics."""
+    print(f"\n{'=' * 70}")
+    print(f"FOLD: held-out query {held_out_query_id} ({queries[held_out_query_id].splitlines()[0]})")
+    print("=" * 70)
 
-    train_query_ids = [qid for qid in queries if qid != HELD_OUT_QUERY_ID]
+    train_query_ids = [qid for qid in queries if qid != held_out_query_id]
     rng = random.Random(SEED)
 
     print("Mining hard-negative pools (ranking corpus against each training query)...")
     hard_negative_pools = mine_hard_negative_pools(train_query_ids, queries, corpus, qrels)
-
     triplets = build_triplets(train_query_ids, queries, corpus, qrels, rng, hard_negative_pools)
-    print(f"Held-out query: {HELD_OUT_QUERY_ID} ({queries[HELD_OUT_QUERY_ID].splitlines()[0]})")
-    print(f"Training queries: {len(train_query_ids)}")
-    print(f"Triplets built: {len(triplets)}")
+    print(f"Training queries: {len(train_query_ids)}  Triplets built: {len(triplets)}")
 
-    print("\nEvaluating zero-shot base model on held-out query...")
-    zero_shot_metrics = evaluate_held_out(MODEL_NAME, queries, corpus, qrels)
+    print("Evaluating zero-shot base model on held-out query...")
+    zero_shot_metrics = evaluate_held_out(MODEL_NAME, held_out_query_id, queries, corpus, qrels)
     print(zero_shot_metrics)
 
     model = SentenceTransformer(MODEL_NAME)
@@ -236,38 +219,67 @@ def main() -> None:
 
     train_rng = random.Random(SEED)
     best_state_dict, best_step, best_ndcg = train_manual(
-        model, loss_fn, triplets, train_rng, queries, corpus, qrels
+        model, loss_fn, triplets, train_rng, held_out_query_id, queries, corpus, qrels
     )
-
-    print(f"\nBest held-out NDCG@10 was {best_ndcg:.4f} at step {best_step}/{MAX_STEPS}")
-    print("Restoring that checkpoint before saving (final step is not necessarily the best).")
+    print(f"Best held-out NDCG@10 was {best_ndcg:.4f} at step {best_step}/{MAX_STEPS}")
     model.load_state_dict(best_state_dict)
 
-    print("\nSanity check: confirming fine-tuned weights differ from the base model...")
-    base_model = SentenceTransformer(MODEL_NAME)
-    base_params = dict(base_model.named_parameters())
-    diff_norm_sq = sum(
-        (trained_param.detach().cpu() - base_params[name].detach().cpu()).pow(2).sum().item()
-        for name, trained_param in model.named_parameters()
-    )
-    diff_norm = diff_norm_sq**0.5
-    print(f"L2 norm of (fine-tuned - base) weights: {diff_norm:.6f}")
-    if diff_norm < 1e-6:
-        print("WARNING: fine-tuned weights are numerically identical to the base model.")
+    output_dir = CHECKPOINT_DIR / f"loqo_{held_out_query_id}_mpnet_triplet"
+    model.save(str(output_dir))
+    print(f"Saved fine-tuned model to {output_dir}")
 
-    model.save(str(OUTPUT_DIR))
-    print(f"\nSaved fine-tuned model to {OUTPUT_DIR}")
+    fine_tuned_metrics = evaluate_held_out(str(output_dir), held_out_query_id, queries, corpus, qrels)
+    print(f"Fine-tuned (best checkpoint) metrics: {fine_tuned_metrics}")
 
-    print("\nEvaluating fine-tuned model on held-out query...")
-    fine_tuned_metrics = evaluate_held_out(str(OUTPUT_DIR), queries, corpus, qrels)
-    print(fine_tuned_metrics)
+    return {
+        "held_out_query_id": held_out_query_id,
+        "best_step": best_step,
+        "zero_shot": zero_shot_metrics,
+        "fine_tuned": fine_tuned_metrics,
+    }
 
-    print("\n=== Comparison on held-out query", HELD_OUT_QUERY_ID, "===")
-    print(f"{'metric':10} {'zero-shot':10} {'fine-tuned':10}")
-    for metric in zero_shot_metrics:
-        print(f"{metric:10} {zero_shot_metrics[metric]:<10.3f} {fine_tuned_metrics[metric]:<10.3f}")
+
+def save_results(all_results):
+    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RESULTS_PATH.write_text(json.dumps(all_results, indent=2), encoding="utf-8")
+
+
+def print_summary(all_results):
+    print(f"\n{'=' * 70}")
+    print(f"SUMMARY across {len(all_results)} fold(s)")
+    print("=" * 70)
+    print(f"{'qid':10} {'zs_ndcg10':10} {'ft_ndcg10':10} {'zs_recall10':12} {'ft_recall10':12}")
+    for r in all_results:
+        zs, ft = r["zero_shot"], r["fine_tuned"]
+        print(
+            f"{r['held_out_query_id']:10} {zs['ndcg@10']:<10.3f} {ft['ndcg@10']:<10.3f} "
+            f"{zs['recall@10']:<12.3f} {ft['recall@10']:<12.3f}"
+        )
+
+    print()
+    for metric in ["recall@10", "recall@50", "mrr", "ndcg@10"]:
+        zs_avg = sum(r["zero_shot"][metric] for r in all_results) / len(all_results)
+        ft_avg = sum(r["fine_tuned"][metric] for r in all_results) / len(all_results)
+        print(f"mean {metric:10} zero-shot={zs_avg:.3f}  fine-tuned={ft_avg:.3f}  delta={ft_avg - zs_avg:+.3f}")
+
+
+def main() -> None:
+    queries = load_queries(SPLIT_DIR)
+    corpus = load_corpus(SPLIT_DIR)
+    qrels = load_qrels(SPLIT_DIR)
+
+    fold_query_ids = FOLD_QUERY_IDS if FOLD_QUERY_IDS is not None else sorted(queries.keys())
+    print(f"Running {len(fold_query_ids)} fold(s): {fold_query_ids}")
+
+    all_results = []
+    for held_out_query_id in fold_query_ids:
+        result = run_fold(held_out_query_id, queries, corpus, qrels)
+        all_results.append(result)
+        save_results(all_results)
+        print(f"(saved progress: {len(all_results)}/{len(fold_query_ids)} folds to {RESULTS_PATH})")
+
+    print_summary(all_results)
 
 
 if __name__ == "__main__":
     main()
-
