@@ -141,10 +141,13 @@ def train_manual(model, loss_fn, triplets, rng, held_out_query_id, queries, corp
     """Plain training loop: builds the optimizer directly on model.parameters(),
     the same tensors used in the forward pass, so updates can't get lost.
 
-    Returns (best_state_dict, best_step, best_ndcg): the held-out NDCG@10 doesn't
-    necessarily peak at the final step (it can rise then decay well before
-    MAX_STEPS), so the best state seen at any periodic eval is kept in memory and
-    handed back, rather than discarding it in favor of the final step.
+    Returns (best_state_dict, best_step, best_metrics): held-out performance
+    doesn't necessarily peak at the final step (it can rise then decay well
+    before MAX_STEPS), so the best state seen at any periodic eval is kept in
+    memory and handed back, rather than discarding it in favor of the final
+    step. "Best" is ranked primarily by ndcg@10, falling through to recall@50
+    then mrr then recall@10 to break ties (ndcg@10 alone can't distinguish
+    among steps where nothing lands in the top 10 at all).
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     device = model.device
@@ -155,7 +158,15 @@ def train_manual(model, loss_fn, triplets, rng, held_out_query_id, queries, corp
 
     best_state_dict = None
     best_step = 0
-    best_ndcg = -1.0
+    best_metrics = None
+    # Compared as a tuple: primarily by ndcg@10, but ndcg@10 is blind to
+    # anything past rank 10 (it's mathematically forced to exactly 0.0
+    # whenever recall@10 is 0, regardless of how close relevant results are
+    # further down) — we've seen steps tie at ndcg@10=0.0 with recall@50
+    # ranging from 0.06 to 0.34. Falling through to recall@50, then mrr, then
+    # recall@10 breaks those ties instead of keeping whichever tied step was
+    # checked first.
+    best_score = (-1.0, -1.0, -1.0, -1.0)
 
     for step in range(1, MAX_STEPS + 1):
         batch_indices = []
@@ -187,12 +198,19 @@ def train_manual(model, loss_fn, triplets, rng, held_out_query_id, queries, corp
             model.train()
             print(f"  held-out eval @ step {step}: {held_out_metrics}")
 
-            if held_out_metrics["ndcg@10"] > best_ndcg:
-                best_ndcg = held_out_metrics["ndcg@10"]
+            score = (
+                held_out_metrics["ndcg@10"],
+                held_out_metrics["recall@50"],
+                held_out_metrics["mrr"],
+                held_out_metrics["recall@10"],
+            )
+            if score > best_score:
+                best_score = score
                 best_step = step
+                best_metrics = held_out_metrics
                 best_state_dict = {key: value.detach().clone().cpu() for key, value in model.state_dict().items()}
 
-    return best_state_dict, best_step, best_ndcg
+    return best_state_dict, best_step, best_metrics
 
 
 def run_fold(held_out_query_id, queries, corpus, qrels):
@@ -218,10 +236,10 @@ def run_fold(held_out_query_id, queries, corpus, qrels):
     loss_fn = TripletLoss(model, distance_metric=TripletDistanceMetric.COSINE, triplet_margin=MARGIN)
 
     train_rng = random.Random(SEED)
-    best_state_dict, best_step, best_ndcg = train_manual(
+    best_state_dict, best_step, best_metrics = train_manual(
         model, loss_fn, triplets, train_rng, held_out_query_id, queries, corpus, qrels
     )
-    print(f"Best held-out NDCG@10 was {best_ndcg:.4f} at step {best_step}/{MAX_STEPS}")
+    print(f"Best held-out checkpoint at step {best_step}/{MAX_STEPS}: {best_metrics}")
     model.load_state_dict(best_state_dict)
 
     output_dir = CHECKPOINT_DIR / f"loqo_{held_out_query_id}_mpnet_triplet"
