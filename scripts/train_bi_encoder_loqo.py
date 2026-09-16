@@ -154,13 +154,24 @@ def evaluate_held_out(model_or_path, queries, corpus, qrels):
 
 def train_manual(model, loss_fn, triplets, rng, queries, corpus, qrels):
     """Plain training loop: builds the optimizer directly on model.parameters(),
-    the same tensors used in the forward pass, so updates can't get lost."""
+    the same tensors used in the forward pass, so updates can't get lost.
+
+    Returns (best_state_dict, best_step, best_ndcg): the held-out NDCG@10 doesn't
+    necessarily peak at the final step (we've seen it rise then decay well before
+    MAX_STEPS), so the best state seen at any periodic eval is kept in memory and
+    handed back, rather than silently discarding it in favor of whatever the
+    final step happens to look like.
+    """
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     device = model.device
 
     order = list(range(len(triplets)))
     rng.shuffle(order)
     position = 0
+
+    best_state_dict = None
+    best_step = 0
+    best_ndcg = -1.0
 
     for step in range(1, MAX_STEPS + 1):
         batch_indices = []
@@ -192,6 +203,13 @@ def train_manual(model, loss_fn, triplets, rng, queries, corpus, qrels):
             model.train()
             print(f"  held-out eval @ step {step}: {held_out_metrics}")
 
+            if held_out_metrics["ndcg@10"] > best_ndcg:
+                best_ndcg = held_out_metrics["ndcg@10"]
+                best_step = step
+                best_state_dict = {key: value.detach().clone().cpu() for key, value in model.state_dict().items()}
+
+    return best_state_dict, best_step, best_ndcg
+
 
 def main() -> None:
     queries = load_queries(SPLIT_DIR)
@@ -217,7 +235,13 @@ def main() -> None:
     loss_fn = TripletLoss(model, distance_metric=TripletDistanceMetric.COSINE, triplet_margin=MARGIN)
 
     train_rng = random.Random(SEED)
-    train_manual(model, loss_fn, triplets, train_rng, queries, corpus, qrels)
+    best_state_dict, best_step, best_ndcg = train_manual(
+        model, loss_fn, triplets, train_rng, queries, corpus, qrels
+    )
+
+    print(f"\nBest held-out NDCG@10 was {best_ndcg:.4f} at step {best_step}/{MAX_STEPS}")
+    print("Restoring that checkpoint before saving (final step is not necessarily the best).")
+    model.load_state_dict(best_state_dict)
 
     print("\nSanity check: confirming fine-tuned weights differ from the base model...")
     base_model = SentenceTransformer(MODEL_NAME)
