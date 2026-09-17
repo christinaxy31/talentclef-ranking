@@ -1,16 +1,16 @@
-"""Compare hard-negative fine-tuning (fixed-step LOQO) against baselines.
+"""Compare hard-negative and random-negative fine-tuning (fixed-step LOQO) against baselines.
 
-Reads three existing results files and prints mean ± sample-stdev per metric,
-all computed over the same 10 English development queries:
+Reads up to four existing results files and prints mean ± sample-stdev per
+metric, all computed over the same 10 English development queries:
 
-- results/bm25_dev.json               BM25 baseline
-- results/bi_encoder_dev.json         zero-shot MPNet bi-encoder
-- results/loqo_full_sweep.json        hard-negative fine-tuned (per-fold held-out results)
+- results/bm25_dev.json                    BM25 baseline
+- results/bi_encoder_dev.json              zero-shot MPNet bi-encoder
+- results/loqo_full_sweep.json             hard-negative fine-tuned (per-fold held-out results)
+- results/loqo_full_sweep_random_neg.json  random-negative fine-tuned (per-fold held-out results)
 
-Note: there is currently no full 10-fold LOQO sweep for random-negative
-fine-tuning to compare against (only single-fold results exist from earlier,
-ad hoc runs) - that baseline is reported as unavailable rather than
-approximated from those anecdotal runs.
+The random-negative file is produced by scripts/train_bi_encoder_loqo_random_neg.py.
+If it hasn't been run yet, that comparison is reported as unavailable rather
+than approximated from old anecdotal single-fold runs.
 """
 
 import json
@@ -21,6 +21,7 @@ RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 BM25_PATH = RESULTS_DIR / "bm25_dev.json"
 ZERO_SHOT_PATH = RESULTS_DIR / "bi_encoder_dev.json"
 HARD_NEGATIVE_PATH = RESULTS_DIR / "loqo_full_sweep.json"
+RANDOM_NEGATIVE_PATH = RESULTS_DIR / "loqo_full_sweep_random_neg.json"
 
 METRICS = ["recall@10", "recall@50", "mrr", "ndcg@10"]
 
@@ -85,11 +86,14 @@ def main() -> None:
 
     print_method("Hard-negative fine-tuned (fixed-step LOQO)", hard_negative, query_ids)
 
-    print(
-        "\nRandom-negative fine-tuning: UNAVAILABLE - no full 10-fold LOQO sweep "
-        "has been run for this baseline yet (only anecdotal single-fold results "
-        "exist from earlier experiments)."
-    )
+    if RANDOM_NEGATIVE_PATH.exists():
+        random_negative = per_query_metrics_from_loqo_sweep(RANDOM_NEGATIVE_PATH)
+        print_method("Random-negative fine-tuned (fixed-step LOQO)", random_negative, query_ids)
+    else:
+        print(
+            f"\nRandom-negative fine-tuned: SKIPPED - {RANDOM_NEGATIVE_PATH} not found "
+            "(run scripts/train_bi_encoder_loqo_random_neg.py first)"
+        )
 
 
 if __name__ == "__main__":
