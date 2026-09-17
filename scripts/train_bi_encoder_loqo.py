@@ -37,6 +37,7 @@ across all 10 folds - the aggregate is the trustworthy signal here, not any
 single fold.
 """
 
+import gc
 import json
 import random
 import statistics
@@ -277,6 +278,16 @@ def main() -> None:
         all_results.append(result)
         save_results(all_results)
         print(f"(saved progress: {len(all_results)}/{len(fold_query_ids)} folds to {RESULTS_PATH})")
+
+        # Each fold loads several full model instances (mining, training,
+        # zero-shot/fine-tuned eval). Python's refcounting frees them when
+        # run_fold() returns, but PyTorch's CUDA caching allocator doesn't
+        # always hand that memory back to the GPU between folds, so usage can
+        # creep up over 10 sequential folds until it OOMs on a request far
+        # smaller than the GPU's nominal free capacity. Force it explicitly.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     print_summary(all_results)
 
