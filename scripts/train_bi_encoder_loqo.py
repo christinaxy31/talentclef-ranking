@@ -1,29 +1,45 @@
-"""Full LOQO bi-encoder fine-tuning sweep: one fold per query, hard-negative TripletLoss.
+"""Full 10-fold LOQO bi-encoder fine-tuning sweep: fixed-step, hard-negative TripletLoss.
 
 Runs leave-one-query-out cross-validation across all 10 English development
-queries. For each fold: hold out one query, mine hard negatives for the other
-9 (rank the full corpus against each training query with the zero-shot base
-model, keep the top HARD_NEGATIVE_POOL_SIZE non-positive documents per query),
-build up to NEG_PER_POSITIVE triplets per positive from that pool (near-dup
-negatives filtered by token Jaccard against the positive), train a *fresh*
-model from scratch with TripletLoss, and evaluate on the held-out query.
+queries. For each fold: hold out one query as the test query, mine hard
+negatives for the other 9 (rank the full corpus against each training query
+with the zero-shot base model, remove known positives, keep the top
+HARD_NEGATIVE_POOL_SIZE non-positive documents per query), build up to
+NEG_PER_POSITIVE triplets per positive from that pool (near-duplicate
+negatives filtered by token Jaccard against the positive they'd be paired
+with), and fine-tune a *fresh* copy of the pretrained model from scratch
+(never carried over between folds) with TripletLoss for a FIXED number of
+steps (MAX_STEPS).
+
+Leakage-free by construction, not by checkpoint selection: MAX_STEPS is a
+predefined development choice, identical across all 10 folds, decided without
+reference to any fold's held-out query. The held-out query is never evaluated
+during training and never influences which checkpoint gets kept - there is no
+"best checkpoint" search. Training runs for exactly MAX_STEPS steps, the
+resulting model is frozen, and the held-out query is evaluated exactly once,
+after training is complete. (An earlier version periodically evaluated the
+held-out query during training to pick a "best" checkpoint by NDCG@10 - that
+is a validation-set-equals-test-set leak and has been removed entirely.)
 
 Training uses a plain manual loop (backward()/optimizer.step() directly), not
 sentence-transformers' SentenceTransformerTrainer: that Trainer/accelerate path
 was found to silently leave model weights unchanged after training while still
 logging plausible-looking loss values. Gradient clipping (MAX_GRAD_NORM) is
 applied explicitly since the Trainer did this for us by default and the manual
-loop otherwise wouldn't. The held-out NDCG@10 is checked periodically during
-training (EVAL_EVERY) and the best-scoring checkpoint is kept, since it can
-peak well before MAX_STEPS and then decay (classic overfitting curve) - the
-final step is not necessarily the best one.
+loop otherwise wouldn't.
 
-Results are saved incrementally to RESULTS_PATH after each fold, so an
-interrupted run (e.g. a Colab timeout) doesn't lose completed folds.
+For each fold, Recall@10, Recall@50, MRR, and NDCG@10 are reported for both
+the zero-shot base model and the fixed-step fine-tuned model on the held-out
+query. Results save incrementally to RESULTS_PATH after each fold (so an
+interrupted run, e.g. a Colab timeout, doesn't lose completed folds), and the
+final summary reports the mean and sample standard deviation of each metric
+across all 10 folds - the aggregate is the trustworthy signal here, not any
+single fold.
 """
 
 import json
 import random
+import statistics
 import sys
 from pathlib import Path
 
@@ -57,13 +73,12 @@ MAX_GRAD_NORM = 1.0
 # query once (using the zero-shot base model), then sample negatives from the
 # top-ranked non-positive documents instead of uniformly at random.
 HARD_NEGATIVE_POOL_SIZE = 50
-# 220 steps x batch size 8 = 1760 triplets = exactly one full epoch over the
-# training positives (per fold; each fold has a slightly different triplet
-# count since a different query's positives are excluded from training).
-MAX_STEPS = 220
-# Evaluate on the held-out query every EVAL_EVERY steps during training (not
-# just before/after), so the best checkpoint can be found and traced.
-EVAL_EVERY = 20
+# Fixed, predefined step count - identical across all 10 folds, chosen without
+# reference to any fold's held-out query. Not tuned per fold, not selected by
+# early stopping. Log every 10 steps for visibility only; nothing is measured
+# against the held-out query until training is fully done.
+MAX_STEPS = 40
+LOG_EVERY = 10
 
 # Restrict to specific query ids for a quick test (e.g. ["46795"]), or None to
 # run the full 10-fold sweep.
@@ -118,8 +133,7 @@ def to_device(features, device):
 
 
 def evaluate_held_out(model_or_path, held_out_query_id, queries, corpus, qrels):
-    """model_or_path: a model name/checkpoint path, or an in-memory SentenceTransformer
-    (the latter avoids a disk round-trip for periodic in-training checks)."""
+    """model_or_path: a model name/checkpoint path, or an in-memory SentenceTransformer."""
     if isinstance(model_or_path, SentenceTransformer):
         bi_encoder = BiEncoder(corpus, model=model_or_path)
     else:
@@ -137,17 +151,13 @@ def evaluate_held_out(model_or_path, held_out_query_id, queries, corpus, qrels):
     }
 
 
-def train_manual(model, loss_fn, triplets, rng, held_out_query_id, queries, corpus, qrels):
+def train_manual(model, loss_fn, triplets, rng):
     """Plain training loop: builds the optimizer directly on model.parameters(),
     the same tensors used in the forward pass, so updates can't get lost.
 
-    Returns (best_state_dict, best_step, best_metrics): held-out performance
-    doesn't necessarily peak at the final step (it can rise then decay well
-    before MAX_STEPS), so the best state seen at any periodic eval is kept in
-    memory and handed back, rather than discarding it in favor of the final
-    step. "Best" is ranked primarily by ndcg@10, falling through to recall@50
-    then mrr then recall@10 to break ties (ndcg@10 alone can't distinguish
-    among steps where nothing lands in the top 10 at all).
+    Runs exactly MAX_STEPS steps and returns nothing - the held-out query is
+    never touched here. There is no checkpoint selection: the model after the
+    final step is what gets evaluated, because MAX_STEPS was fixed in advance.
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     device = model.device
@@ -155,18 +165,6 @@ def train_manual(model, loss_fn, triplets, rng, held_out_query_id, queries, corp
     order = list(range(len(triplets)))
     rng.shuffle(order)
     position = 0
-
-    best_state_dict = None
-    best_step = 0
-    best_metrics = None
-    # Compared as a tuple: primarily by ndcg@10, but ndcg@10 is blind to
-    # anything past rank 10 (it's mathematically forced to exactly 0.0
-    # whenever recall@10 is 0, regardless of how close relevant results are
-    # further down) — we've seen steps tie at ndcg@10=0.0 with recall@50
-    # ranging from 0.06 to 0.34. Falling through to recall@50, then mrr, then
-    # recall@10 breaks those ties instead of keeping whichever tied step was
-    # checked first.
-    best_score = (-1.0, -1.0, -1.0, -1.0)
 
     for step in range(1, MAX_STEPS + 1):
         batch_indices = []
@@ -188,36 +186,15 @@ def train_manual(model, loss_fn, triplets, rng, held_out_query_id, queries, corp
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
         optimizer.step()
 
-        if step % 10 == 0 or step == MAX_STEPS:
+        if step % LOG_EVERY == 0 or step == MAX_STEPS:
             print(f"step {step}/{MAX_STEPS}  loss={loss.item():.4f}")
-
-        if step % EVAL_EVERY == 0 or step == MAX_STEPS:
-            model.eval()
-            with torch.no_grad():
-                held_out_metrics = evaluate_held_out(model, held_out_query_id, queries, corpus, qrels)
-            model.train()
-            print(f"  held-out eval @ step {step}: {held_out_metrics}")
-
-            score = (
-                held_out_metrics["ndcg@10"],
-                held_out_metrics["recall@50"],
-                held_out_metrics["mrr"],
-                held_out_metrics["recall@10"],
-            )
-            if score > best_score:
-                best_score = score
-                best_step = step
-                best_metrics = held_out_metrics
-                best_state_dict = {key: value.detach().clone().cpu() for key, value in model.state_dict().items()}
-
-    return best_state_dict, best_step, best_metrics
 
 
 def run_fold(held_out_query_id, queries, corpus, qrels):
-    """Train and evaluate a single LOQO fold, returning zero-shot vs. best
-    fine-tuned held-out metrics."""
+    """Train and evaluate a single LOQO fold: train on the other 9 queries for
+    a fixed MAX_STEPS, then evaluate the held-out (test) query exactly once."""
     print(f"\n{'=' * 70}")
-    print(f"FOLD: held-out query {held_out_query_id} ({queries[held_out_query_id].splitlines()[0]})")
+    print(f"FOLD: held-out (test) query {held_out_query_id} ({queries[held_out_query_id].splitlines()[0]})")
     print("=" * 70)
 
     train_query_ids = [qid for qid in queries if qid != held_out_query_id]
@@ -232,26 +209,24 @@ def run_fold(held_out_query_id, queries, corpus, qrels):
     zero_shot_metrics = evaluate_held_out(MODEL_NAME, held_out_query_id, queries, corpus, qrels)
     print(zero_shot_metrics)
 
+    # Fresh pretrained model every fold - never carried over from a previous fold.
     model = SentenceTransformer(MODEL_NAME)
     loss_fn = TripletLoss(model, distance_metric=TripletDistanceMetric.COSINE, triplet_margin=MARGIN)
 
     train_rng = random.Random(SEED)
-    best_state_dict, best_step, best_metrics = train_manual(
-        model, loss_fn, triplets, train_rng, held_out_query_id, queries, corpus, qrels
-    )
-    print(f"Best held-out checkpoint at step {best_step}/{MAX_STEPS}: {best_metrics}")
-    model.load_state_dict(best_state_dict)
+    train_manual(model, loss_fn, triplets, train_rng)
 
     output_dir = CHECKPOINT_DIR / f"loqo_{held_out_query_id}_mpnet_triplet"
     model.save(str(output_dir))
     print(f"Saved fine-tuned model to {output_dir}")
 
+    # Held-out query evaluated exactly once, here, after training is fully done.
     fine_tuned_metrics = evaluate_held_out(str(output_dir), held_out_query_id, queries, corpus, qrels)
-    print(f"Fine-tuned (best checkpoint) metrics: {fine_tuned_metrics}")
+    print(f"Fine-tuned (fixed {MAX_STEPS}-step) metrics: {fine_tuned_metrics}")
 
     return {
         "held_out_query_id": held_out_query_id,
-        "best_step": best_step,
+        "max_steps": MAX_STEPS,
         "zero_shot": zero_shot_metrics,
         "fine_tuned": fine_tuned_metrics,
     }
@@ -264,7 +239,7 @@ def save_results(all_results):
 
 def print_summary(all_results):
     print(f"\n{'=' * 70}")
-    print(f"SUMMARY across {len(all_results)} fold(s)")
+    print(f"SUMMARY across {len(all_results)} fold(s)  (fixed {MAX_STEPS}-step recipe)")
     print("=" * 70)
     print(f"{'qid':10} {'zs_ndcg10':10} {'ft_ndcg10':10} {'zs_recall10':12} {'ft_recall10':12}")
     for r in all_results:
@@ -276,9 +251,16 @@ def print_summary(all_results):
 
     print()
     for metric in ["recall@10", "recall@50", "mrr", "ndcg@10"]:
-        zs_avg = sum(r["zero_shot"][metric] for r in all_results) / len(all_results)
-        ft_avg = sum(r["fine_tuned"][metric] for r in all_results) / len(all_results)
-        print(f"mean {metric:10} zero-shot={zs_avg:.3f}  fine-tuned={ft_avg:.3f}  delta={ft_avg - zs_avg:+.3f}")
+        zs_values = [r["zero_shot"][metric] for r in all_results]
+        ft_values = [r["fine_tuned"][metric] for r in all_results]
+        zs_mean = statistics.mean(zs_values)
+        ft_mean = statistics.mean(ft_values)
+        zs_std = statistics.stdev(zs_values) if len(zs_values) > 1 else 0.0
+        ft_std = statistics.stdev(ft_values) if len(ft_values) > 1 else 0.0
+        print(
+            f"mean {metric:10} zero-shot={zs_mean:.3f}±{zs_std:.3f}  "
+            f"fine-tuned={ft_mean:.3f}±{ft_std:.3f}  delta={ft_mean - zs_mean:+.3f}"
+        )
 
 
 def main() -> None:
@@ -287,7 +269,7 @@ def main() -> None:
     qrels = load_qrels(SPLIT_DIR)
 
     fold_query_ids = FOLD_QUERY_IDS if FOLD_QUERY_IDS is not None else sorted(queries.keys())
-    print(f"Running {len(fold_query_ids)} fold(s): {fold_query_ids}")
+    print(f"Running {len(fold_query_ids)} fold(s) at a fixed {MAX_STEPS} steps each: {fold_query_ids}")
 
     all_results = []
     for held_out_query_id in fold_query_ids:
