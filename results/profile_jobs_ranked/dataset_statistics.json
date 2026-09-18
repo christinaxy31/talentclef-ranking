@@ -1,0 +1,36 @@
+{
+  "n_profiles_sampled": 10000,
+  "shard_indices_read": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "seed": 42,
+  "split_row_counts": {
+    "train": 194611,
+    "val": 24300,
+    "test": 24239
+  },
+  "split_profile_counts": {
+    "train": 7970,
+    "val": 996,
+    "test": 995
+  },
+  "total_rows": 243150,
+  "grade_stats": {
+    "mean": 33.21732091506573,
+    "median": 28.0,
+    "min": 0.0,
+    "max": 100.0,
+    "std": 31.74268653688734
+  },
+  "candidates_per_profile": {
+    "mean": 24.41019977913864,
+    "min": 1,
+    "max": 25
+  },
+  "elapsed_seconds": 17.9
+}

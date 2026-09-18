@@ -1,1 +1,5 @@
 sentence-transformers
+datasets
+pandas
+pyarrow
+huggingface_hub
