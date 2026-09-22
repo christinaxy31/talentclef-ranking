@@ -10,7 +10,7 @@ POSITIVE_THRESHOLD; hard negatives = candidates at least NEGATIVE_GAP points
 below it. No separate hard-negative mining step is needed here (unlike
 TalentCLEF), since the candidates are already a pre-retrieved, plausible pool.
 
-Checkpoint selection here legitimately uses a validation subsample (never the
+Checkpoint selection here legitimately uses the full validation set (never the
 test set) - unlike the earlier TalentCLEF LOQO setup, where the held-out
 query stood in for both validation and test, which was a real leakage bug we
 found and removed. Here validation and test are genuinely disjoint, separately
@@ -60,29 +60,32 @@ POSITIVE_THRESHOLD = 61
 NEGATIVE_GAP = 20
 
 # Deliberately generous rather than precisely tuned: with ~19,900 triplets
-# available, 1000 steps x batch 8 covers ~40% of one pass. Validation-based
+# available, 2500 steps x batch 8 covers ~100% of one pass. Validation-based
 # checkpoint selection (not a fixed step count) is what actually picks the
 # good checkpoint here, unlike the TalentCLEF LOQO recipe.
-MAX_STEPS = 1000
+MAX_STEPS = 2500
 LOG_EVERY = 20
-EVAL_EVERY = 50
-# Full validation set is 996 profiles; evaluating that at every one of ~20
-# checkpoints would be slow. A fixed seeded subsample is enough to compare
-# checkpoints against each other - only the FINAL test evaluation must use
-# the complete, untouched set.
-N_VALIDATION_EVAL_PROFILES = 200
+# Checks the FULL validation set (996 profiles), not a subsample - 10 checks
+# over 2500 steps. Slower per check than a subsample would be, but every
+# checkpoint comparison and the zero-shot validation baseline are then all
+# measured on the exact same, complete set.
+EVAL_EVERY = 250
 
 
 def to_device(features, device):
     return {key: (value.to(device) if hasattr(value, "to") else value) for key, value in features.items()}
 
 
-def train_manual(model, loss_fn, triplets, rng, validation_subset):
+def train_manual(model, loss_fn, triplets, rng, validation_data):
     """Plain training loop: optimizer built directly on model.parameters(), the
     same tensors used in the forward pass. Periodically evaluates on
-    validation_subset (never the test set) and keeps the best-scoring
+    validation_data (never the test set) and keeps the best-scoring
     checkpoint in memory, ranked by (ndcg@10, recall@50, mrr, recall@10) -
     ndcg@10 primary, falling through to the others to break ties.
+
+    Returns (best_state_dict, best_step, best_metrics, validation_curve) -
+    validation_curve is every {step, loss, **val_metrics} checked along the
+    way (not just the best one), for plotting validation NDCG@10 vs. step.
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     device = model.device
@@ -95,6 +98,7 @@ def train_manual(model, loss_fn, triplets, rng, validation_subset):
     best_step = 0
     best_metrics = None
     best_score = (-1.0, -1.0, -1.0, -1.0)
+    validation_curve = []
 
     for step in range(1, MAX_STEPS + 1):
         batch_indices = []
@@ -122,9 +126,10 @@ def train_manual(model, loss_fn, triplets, rng, validation_subset):
         if step % EVAL_EVERY == 0 or step == MAX_STEPS:
             model.eval()
             with torch.no_grad():
-                val_metrics = evaluate_profiles(model, validation_subset)
+                val_metrics = evaluate_profiles(model, validation_data)
             model.train()
             print(f"  validation eval @ step {step}: {val_metrics}")
+            validation_curve.append({"step": step, "loss": loss.item(), **val_metrics})
 
             score = (val_metrics["ndcg@10"], val_metrics["recall@50"], val_metrics["mrr"], val_metrics["recall@10"])
             if score > best_score:
@@ -133,7 +138,7 @@ def train_manual(model, loss_fn, triplets, rng, validation_subset):
                 best_metrics = val_metrics
                 best_state_dict = {key: value.detach().clone().cpu() for key, value in model.state_dict().items()}
 
-    return best_state_dict, best_step, best_metrics
+    return best_state_dict, best_step, best_metrics, validation_curve
 
 
 def main() -> None:
@@ -157,15 +162,9 @@ def main() -> None:
     )
     print(f"  triplets built: {len(triplets)}")
 
-    print("\nSampling fixed validation subset for periodic checks during training...")
-    val_profile_ids = sorted(val_df["profile_id"].unique())
-    subset_ids = random.Random(SEED).sample(val_profile_ids, min(N_VALIDATION_EVAL_PROFILES, len(val_profile_ids)))
-    validation_subset = val_df[val_df["profile_id"].isin(subset_ids)]
-    print(f"  validation subset: {len(validation_subset)} rows, {validation_subset['profile_id'].nunique()} profiles")
-
     print("\nEvaluating zero-shot base model...")
-    zero_shot_val = evaluate_profiles(MODEL_NAME, validation_subset)
-    print(f"  zero-shot on validation subset: {zero_shot_val}")
+    zero_shot_val = evaluate_profiles(MODEL_NAME, val_df)
+    print(f"  zero-shot on FULL validation set: {zero_shot_val}")
     zero_shot_test = evaluate_profiles(MODEL_NAME, test_df)
     print(f"  zero-shot on FULL test set: {zero_shot_test}")
 
@@ -174,7 +173,9 @@ def main() -> None:
     loss_fn = TripletLoss(model, distance_metric=TripletDistanceMetric.COSINE, triplet_margin=MARGIN)
     train_rng = random.Random(SEED)
 
-    best_state_dict, best_step, best_val_metrics = train_manual(model, loss_fn, triplets, train_rng, validation_subset)
+    best_state_dict, best_step, best_val_metrics, validation_curve = train_manual(
+        model, loss_fn, triplets, train_rng, val_df
+    )
     print(f"\nBest validation checkpoint at step {best_step}/{MAX_STEPS}: {best_val_metrics}")
     model.load_state_dict(best_state_dict)
 
@@ -182,7 +183,7 @@ def main() -> None:
     print(f"Saved fine-tuned model to {CHECKPOINT_DIR}")
 
     # Full test set evaluated exactly once, here, after the checkpoint was
-    # already selected using only the validation subset above.
+    # already selected using only the validation set above.
     print("\nEvaluating fine-tuned model on FULL test set (exactly once)...")
     fine_tuned_test = evaluate_profiles(str(CHECKPOINT_DIR), test_df)
     print(f"  fine-tuned on FULL test set: {fine_tuned_test}")
@@ -200,12 +201,15 @@ def main() -> None:
             "negative_gap": NEGATIVE_GAP,
             "max_steps": MAX_STEPS,
             "eval_every": EVAL_EVERY,
-            "n_validation_eval_profiles": N_VALIDATION_EVAL_PROFILES,
         },
         "n_triplets": len(triplets),
         "best_step": best_step,
-        "zero_shot": {"validation_subset": zero_shot_val, "test_full": zero_shot_test},
-        "fine_tuned": {"validation_subset_at_best_step": best_val_metrics, "test_full": fine_tuned_test},
+        "zero_shot": {"validation_full": zero_shot_val, "test_full": zero_shot_test},
+        "fine_tuned": {"validation_full_at_best_step": best_val_metrics, "test_full": fine_tuned_test},
+        # Every periodic checkpoint's {step, loss, recall@10, recall@50, mrr,
+        # ndcg@10} on the full validation set, in order - e.g. for plotting
+        # validation NDCG@10 vs. training step.
+        "validation_curve": validation_curve,
         "elapsed_seconds": round(time.time() - t0, 1),
     }
     RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
