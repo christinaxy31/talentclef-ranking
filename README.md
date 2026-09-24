@@ -111,17 +111,6 @@ python scripts/compare_loqo_results.py              # side-by-side comparison ag
 
 Each sweep saves per-fold results incrementally to `results/loqo_full_sweep.json` / `results/loqo_full_sweep_random_neg.json` (so an interrupted run doesn't lose completed folds) and fine-tuned checkpoints to `results/checkpoints/`.
 
-## Negative Sampling Ablation
-
-To measure the effect of negative-sampling strategy, the same MPNet bi-encoder was compared under three conditions:
-
-| Model | Recall@10 | Recall@50 | MRR | NDCG@10 |
-|---|---:|---:|---:|---:|
-| Zero-shot MPNet | 0.2893 | 0.7966 | 1.0000 | 0.9640 |
-| Random-negative fine-tuning | 0.2955 | 0.8037 | 1.0000 | 0.9768 |
-| **Hard-negative fine-tuning** | **0.2986** | **0.8112** | **1.0000** | **0.9873** |
-
-All fine-tuned models use the same fixed 40-step LOQO evaluation protocol.
 
 
 
@@ -135,6 +124,8 @@ All fine-tuned models use the same fixed 40-step LOQO evaluation protocol.
 | Zero-shot MPNet | 0.2893 | 0.7966 | 1.0000 | 0.9640 |
 | Random-negative MPNet | 0.2955 | 0.8037 | 1.0000 | 0.9768 |
 | **Hard-negative MPNet** | **0.2986** | **0.8112** | **1.0000** | **0.9873** |
+
+All fine-tuned models use the same fixed 40-step LOQO evaluation protocol.
 
 Hard-negative fine-tuning produced the strongest aggregate ranking results,
 suggesting that high-ranked but non-relevant resumes provide more informative
