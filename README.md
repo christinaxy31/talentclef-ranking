@@ -95,25 +95,20 @@ To measure the effect of negative-sampling strategy, the same MPNet bi-encoder w
 
 All fine-tuned models use the same fixed 40-step LOQO evaluation protocol.
 
-### Results
 
-Random-negative fine-tuning improved mean NDCG@10 from **0.9640 to 0.9768**, while hard-negative fine-tuning increased it further to **0.9873**.
 
-Compared with the zero-shot model, hard-negative fine-tuning achieved:
+## Retrieval Results
 
-- **+0.0093 Recall@10**
-- **+0.0146 Recall@50**
-- **+0.0233 NDCG@10**
+All models were evaluated on the same 10 TalentCLEF queries. Fine-tuned
+models use fixed 40-step Leave-One-Query-Out (LOQO) training to prevent
+the held-out query from influencing checkpoint selection.
 
-The improvement is particularly notable given the strong zero-shot baseline (NDCG@10 = 0.9640). Hard-negative fine-tuning reduced the remaining gap to perfect NDCG@10 by approximately **65%**.
-
-The largest differences appeared on the more difficult held-out queries. For example, on query `46795`:
-
-| Model | Recall@10 | NDCG@10 |
-|---|---:|---:|
-| Zero-shot MPNet | 0.2500 | 0.8512 |
-| Random-negative FT | 0.2500 | 0.8415 |
-| Hard-negative FT | **0.2813** | **0.9364** |
+| Model | Recall@10 | Recall@50 | MRR | NDCG@10 |
+|---|---:|---:|---:|---:|
+| BM25 | 0.2763 | 0.7970 | 0.9200 | 0.8941 |
+| Zero-shot MPNet | 0.2893 | 0.7966 | 1.0000 | 0.9640 |
+| Random-negative MPNet | 0.2955 | 0.8037 | 1.0000 | 0.9768 |
+| **Hard-negative MPNet** | **0.2986** | **0.8112** | **1.0000** | **0.9873** |
 
 Random negatives provided little useful supervision for this query, whereas hard negatives substantially improved top-ranked retrieval quality.
 
@@ -121,6 +116,6 @@ MRR remained at 1.0 across all three conditions, indicating a ceiling effect: th
 
 ### Takeaway
 
-Under the fixed-step LOQO evaluation, **hard-negative fine-tuning produced the strongest average retrieval performance**. The results suggest that training on candidates the base retriever finds plausibly relevant provides more informative supervision than sampling negatives randomly.
+Dense retrieval substantially improved ranking quality over BM25, while fine-tuning provided additional gains. Hard-negative fine-tuning achieved the strongest overall results, reaching 0.9873 mean NDCG@10 compared with 0.8941 for BM25, 0.9640 for zero-shot MPNet, and 0.9768 for random-negative fine-tuning. The advantage of hard negatives was most apparent on difficult queries, suggesting that training against plausible but non-relevant candidates provides more informative ranking supervision than uniformly sampled negatives.
 
 Because TalentCLEF contains only 10 labeled queries and several queries already have near-perfect zero-shot NDCG@10, these results should be interpreted as a **small-data ablation study rather than definitive evidence of generalization**. A larger query-level dataset is needed for more robust train/validation/test evaluation.
