@@ -264,6 +264,11 @@ def build_triplets_from_grades(
     candidates at least negative_gap points below that positive grade. Up to
     neg_per_positive of those are sampled per profile. Profiles with no
     qualifying positive, or no qualifying hard negative, are skipped.
+
+    Each returned dict also carries positive_grade/negative_grade (the raw
+    0-100 grades behind the pair) alongside anchor/positive/negative - unused
+    by the fixed-margin baseline, but lets graded-relevance-aware losses
+    (e.g. adaptive-margin) compute the grade gap without re-deriving it.
     """
     rng = random.Random(seed)
     triplets = []
@@ -277,13 +282,19 @@ def build_triplets_from_grades(
         positive_row = group[group["grade"] == max_grade].sort_values("retrieval_score", ascending=False).iloc[0]
         positive_text = positive_row["job_text"]
 
-        hard_neg_texts = group.loc[group["grade"] <= max_grade - negative_gap, "job_text"].tolist()
-        if not hard_neg_texts:
+        hard_negatives = group.loc[group["grade"] <= max_grade - negative_gap, ["job_text", "grade"]].to_dict("records")
+        if not hard_negatives:
             continue
 
-        sample_size = min(neg_per_positive, len(hard_neg_texts))
-        for neg_text in rng.sample(hard_neg_texts, sample_size):
-            triplets.append({"anchor": profile_text, "positive": positive_text, "negative": neg_text})
+        sample_size = min(neg_per_positive, len(hard_negatives))
+        for neg in rng.sample(hard_negatives, sample_size):
+            triplets.append({
+                "anchor": profile_text,
+                "positive": positive_text,
+                "negative": neg["job_text"],
+                "positive_grade": float(max_grade),
+                "negative_grade": float(neg["grade"]),
+            })
 
     return triplets
 
