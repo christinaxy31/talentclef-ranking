@@ -202,6 +202,8 @@ def train_manual(model, triplets, rng, validation_data, zero_shot_val, zero_shot
 
         start_step = 1
 
+    # within max steps，run multiple epochs，each step = one batch
+    # epochs≈MAX_STEPS×BATCH_SIZE​/len(triplets)
     for step in range(start_step, MAX_STEPS + 1):
         batch_indices = []
         while len(batch_indices) < BATCH_SIZE:
