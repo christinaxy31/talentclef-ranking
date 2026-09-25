@@ -269,11 +269,14 @@ def build_triplets_from_grades(
     0-100 grades behind the pair) alongside anchor/positive/negative - unused
     by the fixed-margin baseline, but lets graded-relevance-aware losses
     (e.g. adaptive-margin) compute the grade gap without re-deriving it.
+    Also carries profile_id, so callers can recover exactly which profiles
+    were "eligible" (cleared positive_threshold and had a qualifying hard
+    negative) without re-deriving that rule themselves.
     """
     rng = random.Random(seed)
     triplets = []
 
-    for _profile_id, group in train_df.groupby("profile_id", sort=True):
+    for profile_id, group in train_df.groupby("profile_id", sort=True):
         max_grade = group["grade"].max()
         if max_grade < positive_threshold:
             continue
@@ -294,6 +297,7 @@ def build_triplets_from_grades(
                 "negative": neg["job_text"],
                 "positive_grade": float(max_grade),
                 "negative_grade": float(neg["grade"]),
+                "profile_id": profile_id,
             })
 
     return triplets
