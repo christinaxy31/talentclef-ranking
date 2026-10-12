@@ -35,6 +35,7 @@ script produces:
     training finishes, then evaluated on the test set exactly once.
 """
 
+import gc
 import json
 import os
 import random
@@ -303,6 +304,16 @@ def main() -> None:
         print(f"  zero-shot on FULL validation set: {zero_shot_val}")
         zero_shot_test = evaluate_profiles(MODEL_NAME, test_df)
         print(f"  zero-shot on FULL test set: {zero_shot_test}")
+
+    # evaluate_profiles(MODEL_NAME, ...) above loads its own SentenceTransformer
+    # instance each call and encodes thousands of profile/job texts. Python's
+    # refcounting frees those once the call returns, but PyTorch's CUDA caching
+    # allocator doesn't always hand that memory back to the GPU in time for the
+    # fresh model below - same OOM-creep issue already seen across LOQO folds
+    # in train_bi_encoder_loqo.py. Force it explicitly before training starts.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     print(
         f"\nFine-tuning (fresh {MODEL_NAME}, up to {MAX_STEPS} steps, "
