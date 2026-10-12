@@ -195,8 +195,12 @@ def train_manual(
     """Plain training loop: optimizer built directly on model.parameters(), the
     same tensors used in the forward pass. Each step samples PROFILES_PER_BATCH
     profile_ids, scores each one's FULL candidate pool, and computes the
-    LambdaRank loss (lambda_pair_loss) per profile - summed across the batch
-    and divided by the total pair count for the step's loss.
+    LambdaRank loss (lambda_pair_loss) per profile - each profile's own mean
+    pairwise loss is backward()-ed immediately (gradient accumulation) and
+    then averaged equally across the batch's profiles, rather than building
+    every profile's graph first and backward()-ing once at the end (which
+    needs all of them held in memory simultaneously - a real CUDA OOM risk
+    on a modest GPU with PROFILES_PER_BATCH > 1).
 
     Periodically evaluates on validation_data (never the test set) and keeps
     the best-scoring checkpoint in memory, ranked by
@@ -259,8 +263,24 @@ def train_manual(
             position += 1
         batch_profile_ids = [eligible_profile_ids[i] for i in batch_indices]
 
-        profile_losses = []
-        total_pairs = 0
+        # Gradient accumulation across profiles, one at a time: backward()
+        # immediately after each profile's forward pass, instead of building
+        # all PROFILES_PER_BATCH computation graphs first and backward()-ing
+        # once at the end. The latter needs every profile's full set of
+        # transformer activations held in memory simultaneously (needed for
+        # backprop) - that's what actually drove the CUDA OOM, not leftover
+        # memory from the zero-shot eval. Backward-ing per profile means only
+        # one profile's graph is ever alive at once, independent of
+        # PROFILES_PER_BATCH. This also changes the normalization from "mean
+        # over every pair pooled across the batch" to "mean of each profile's
+        # own per-pair mean, averaged equally across profiles" - a deliberate,
+        # standard listwise-ranking choice (per-query averaging) that happens
+        # to also be what makes the immediate-backward trick valid, since each
+        # profile's contribution no longer depends on the other profiles'
+        # pair counts.
+        optimizer.zero_grad()
+        loss_value = 0.0
+        profiles_used = 0
         for profile_id in batch_profile_ids:
             group = profile_groups[profile_id]
             anchor_text = group["profile_text"].iloc[0]
@@ -279,23 +299,21 @@ def train_manual(
             if result is None:
                 continue
             profile_loss_sum, n_pairs = result
-            profile_losses.append(profile_loss_sum)
-            total_pairs += n_pairs
+            scaled_loss = (profile_loss_sum / n_pairs) / len(batch_profile_ids)
+            scaled_loss.backward()  # frees this profile's graph once done - only one alive at a time
+            loss_value += scaled_loss.item()
+            profiles_used += 1
 
-        if total_pairs == 0:
+        if profiles_used == 0:
             # Shouldn't happen for eligible profiles (see lambda_pair_loss's
-            # docstring), but skip cleanly rather than divide by zero.
+            # docstring), but skip cleanly rather than step on all-zero grads.
             continue
 
-        loss = sum(profile_losses) / total_pairs
-
-        optimizer.zero_grad()
-        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
         optimizer.step()
 
         if step % LOG_EVERY == 0 or step == MAX_STEPS:
-            print(f"step {step}/{MAX_STEPS}  loss={loss.item():.4f}")
+            print(f"step {step}/{MAX_STEPS}  loss={loss_value:.4f}")
 
         if step % EVAL_EVERY == 0 or step == MAX_STEPS:
             model.eval()
@@ -303,7 +321,7 @@ def train_manual(
                 val_metrics = evaluate_profiles(model, validation_data)
             model.train()
             print(f"  validation eval @ step {step}: {val_metrics}")
-            validation_curve.append({"step": step, "loss": loss.item(), **val_metrics})
+            validation_curve.append({"step": step, "loss": loss_value, **val_metrics})
 
             score = (val_metrics["ndcg@10"], val_metrics["recall@50"], val_metrics["mrr"], val_metrics["recall@10"])
             if score > best_score:
