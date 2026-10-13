@@ -226,21 +226,97 @@ This suggests that fine-tuning primarily improved the ordering of relevant
 jobs near the top of the ranked candidate set rather than expanding
 top-50 coverage.
 
+## Graded-Relevance-Aware Loss Experiments
+
+The fixed-margin baseline above uses relevance grades only to construct
+triplets (high-grade jobs as positives, sufficiently lower-grade jobs as
+negatives); the `TripletLoss` itself does not model the *magnitude* of the
+0–100 relevance gap. Three loss variants were implemented to test whether
+using that magnitude directly improves on the fixed-margin baseline:
+
+1. **Adaptive-margin triplet loss** — the required separation between
+   positive and negative scales linearly with the grade gap (`margin ∈
+   [0.2, 0.4]` as the gap spans `[20, 100]`), instead of a single fixed
+   margin for every triplet.
+2. **Weighted pairwise ranking loss** — a RankNet-style pairwise loss
+   (`softplus` on the score difference, no margin) weighted by `grade_gap /
+   100`, so a badly-misordered pair with a large grade gap contributes more
+   gradient than a borderline one.
+3. **NDCG-aware ranking loss (true LambdaRank)** — each pair's weight is the
+   actual `|ΔNDCG@10|` from swapping its *current* rank within the profile's
+   full candidate pool, not a static function of the grade gap — the same
+   linear-gain, `1/log2(rank+1)`-discount convention used by this project's
+   own `graded_ndcg_at_k` evaluation metric.
+
+All three reuse the exact same data split, triplet-eligibility rule,
+hyperparameters (`lr=1e-6`, `max_grad_norm=1.0`, `max_steps=2500`,
+`eval_every=250`), and validation-based checkpoint-selection protocol as the
+fixed-margin baseline, so results are directly comparable.
+
+### Results
+
+| Model | Best step | Validation NDCG@10 | **Test NDCG@10** | Test Recall@10 | Test MRR |
+|---|---:|---:|---:|---:|---:|
+| Zero-shot MPNet | – | 0.7274 | 0.7058 | 0.4316 | 0.5500 |
+| **Adaptive-margin** | 2,500 | 0.7536 | **0.7419** | **0.4602** | **0.5865** |
+| Fixed-margin (baseline) | 2,000 | **0.7562** | 0.7394 | 0.4601 | 0.5835 |
+| Weighted-pairwise | 250 | 0.7428 | 0.7281 | 0.4454 | 0.5715 |
+| NDCG-aware (LambdaRank) | 250 | 0.7315 | 0.7103 | 0.4336 | 0.5490 |
+
+All four beat zero-shot, confirming fine-tuning helps regardless of loss
+choice. Among the four, **adaptive-margin wins on every test-set metric**
+(NDCG@10, Recall@10, and MRR) despite scoring lower than the fixed-margin
+baseline on validation NDCG@10 (0.7536 vs. 0.7562) — a reminder that the
+validation-based ranking used for checkpoint selection and the final test
+ranking don't always agree exactly, especially at this margin. Weighted-
+pairwise and NDCG-aware both land clearly behind both margin-based methods.
+
+### Why the pairwise losses underperformed: an early-peak, then-decline pattern
+
+The most striking signal isn't in the final numbers but in *when* each
+method's best checkpoint occurred. Fixed-margin and adaptive-margin peaked
+late (step 2,000 and step 2,500 respectively) with validation NDCG@10 that
+was flat-to-improving for most of training. Weighted-pairwise and NDCG-aware
+both peaked at the **very first** validation checkpoint (step 250) and then
+declined steadily for the remaining 2,250 steps — NDCG-aware's validation
+NDCG@10 drops from 0.7315 at step 250 to 0.7169 at step 2,500.
+
+A likely explanation: `relu(dist_pos - dist_neg + margin)` has a true
+zero-gradient region once a pair is separated by at least `margin` — the
+loss stops pushing once a pair is "good enough." The pairwise losses'
+`softplus(score_diff)` has no such floor; it keeps gradually pushing *every*
+pair further apart, including pairs that are already correctly ordered, for
+as long as training continues. Without a margin to satisfy and stop at,
+many steps of continued pushing can slowly distort the embedding space away
+from useful structure, even at a learning rate as small as `1e-6`. NDCG-aware
+declines fastest, consistent with it having both a smaller number of
+independent gradient sources per step (`profiles_per_batch=4` full candidate
+pools vs. 8 independently-sampled triplets) and a target (current rank
+position) that shifts under it as training progresses, rather than a fixed,
+grade-only target.
+
+NDCG-aware was also the most computationally expensive by far — 6.4 hours
+vs. 3.6–3.8 hours for the other three — for the weakest result, since it
+scores each profile's entire ~25-candidate pool every step instead of 3
+texts per triplet.
+
+### Takeaway
+
+Under a fixed 2,500-step budget with no early stopping, the two losses with
+a true "stop pushing once satisfied" margin (fixed-margin and adaptive-margin)
+outperformed the two margin-free pairwise losses (weighted-pairwise and
+NDCG-aware LambdaRank), reversing the naive expectation that a loss more
+directly aligned with the evaluation metric (NDCG-aware) would win. Adaptive
+margin provided a small test-set improvement over the fixed-margin baseline,
+suggesting there is a modest benefit to scaling the margin with relevance
+gap — but the much larger effect in this comparison is the presence or
+absence of a saturating margin itself, not which loss formulation is
+nominally more sophisticated.
+
 ## Next Experiments
 
-The current baseline uses relevance grades only to construct triplets:
-high-grade jobs are treated as positives and sufficiently lower-grade jobs
-as negatives. The fixed-margin TripletLoss itself does not directly model
-the magnitude of the 0–100 relevance difference.
-
-Planned experiments therefore focus on graded-relevance-aware objectives:
-
-1. **Adaptive-margin triplet loss** — increase the required separation as the
-   relevance-grade gap increases.
-2. **Weighted pairwise ranking loss** — weight ranking errors according to
-   the difference in relevance grades.
-3. **NDCG-aware ranking loss** — directly emphasize ranking mistakes that have
-   larger impact on NDCG.
-4. **Cross-dataset evaluation on TalentCLEF** — evaluate whether representations
-   learned from large-scale profile–job supervision transfer to an independent
-   job-to-resume benchmark.
+**Cross-dataset evaluation on TalentCLEF** — evaluate whether representations
+learned from large-scale profile–job supervision transfer to an independent
+job-to-resume benchmark, by running `scripts/evaluate_bi_encoder.py --model
+<winning Profile-Jobs-Ranked checkpoint>` against the existing TalentCLEF
+dev-query evaluation, with no retraining.
